@@ -31,14 +31,29 @@ export interface MatchStep {
   isMatch: boolean
 }
 
+export interface GroupCapture {
+  index: number // 0 = 整体匹配，1..N = 捕获分组
+  name: string | null // 命名分组名，未命名为 null
+  text: string | null // null = 该分组未参与匹配；'' = 参与但捕获为空
+  start: number // 在测试字符串中的起始偏移，未参与为 -1
+  end: number // 结束偏移（不含），未参与为 -1
+}
+
 export interface MatchResult {
   matched: boolean
   matchText: string
-  groups: string[]
+  matchStart: number
+  matchEnd: number
+  groups: GroupCapture[]
   steps: MatchStep[]
   backtracks: number
   totalSteps: number
   duration: number
+}
+
+export interface HighlightRun {
+  text: string
+  groupIndex: number | null // null = 整体匹配内不属于任何分组的片段
 }
 
 export interface RegexTemplate {
@@ -54,4 +69,5 @@ export interface ASTNode {
   value?: string
   children?: ASTNode[]
   groupIndex?: number
+  name?: string
 }

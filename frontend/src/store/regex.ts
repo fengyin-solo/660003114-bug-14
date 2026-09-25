@@ -1,8 +1,10 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode, GroupCapture, HighlightRun } from '../types'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
+const WHOLE_MATCH_COLOR = '#16a34a'
+const MAX_REPEAT = 100
 
 export const TEMPLATES: RegexTemplate[] = [
   { name: '邮箱地址', pattern: '^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$', description: '匹配标准邮箱格式：用户名@域名.顶级域', testString: 'user@example.com admin@mail.org test.user+tag@sub.domain.co.uk', category: '常用' },
@@ -33,13 +35,26 @@ interface StateNode {
   isAccept: boolean
   transitions: Map<string, number[]>
   epsilonTransitions: number[]
+  groupMarker?: { index: number; type: 'open' | 'close' }
+  classMatcher?: (ch: string) => boolean
 }
 
-function buildNFA(pattern: string): { states: StateNode[]; startState: number; acceptStates: number[] } {
+interface CaptureSpan {
+  start?: number
+  end?: number
+}
+
+interface Thread {
+  state: number
+  caps: Map<number, CaptureSpan>
+}
+
+function buildNFA(pattern: string): { states: StateNode[]; startState: number; acceptStates: number[]; groupCount: number; groupNames: (string | null)[] } {
   const states: StateNode[] = []
   let stateCounter = 0
   let pos = 0
   let groupCount = 0
+  const groupNames: (string | null)[] = [null]
 
   function newState(): number {
     const id = stateCounter++
@@ -63,90 +78,252 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
     if (negative) pos++
     const ranges: [string, string][] = []
     const chars: string[] = []
-    while (pos < pattern.length && pattern[pos] !== ']') {
-      if (pattern[pos + 1] === '-' && pattern[pos + 2] && pattern[pos + 2] !== ']') {
-        ranges.push([pattern[pos], pattern[pos + 2]])
-        pos += 3
-      } else {
-        chars.push(pattern[pos])
+    const predicates: ((ch: string) => boolean)[] = []
+    // 读取一个转义单元：\uXXXX、\d\w\s（返回 null 并登记谓词）、其他转义按字面字符
+    const readEscaped = (): string | null => {
+      pos++ // skip backslash
+      const e = pattern[pos]
+      if (e === 'u' && /^[0-9a-fA-F]{4}$/.test(pattern.substr(pos + 1, 4))) {
+        const c = String.fromCharCode(parseInt(pattern.substr(pos + 1, 4), 16))
+        pos += 5
+        return c
+      }
+      if (e === 'd' || e === 'w' || e === 's') {
+        predicates.push(e === 'd' ? (c => /\d/.test(c)) : e === 'w' ? (c => /\w/.test(c)) : (c => /\s/.test(c)))
         pos++
+        return null
+      }
+      pos++
+      return e
+    }
+    while (pos < pattern.length && pattern[pos] !== ']') {
+      let c: string | null
+      if (pattern[pos] === '\\') {
+        c = readEscaped()
+        if (c === null) continue
+      } else {
+        c = pattern[pos]
+        pos++
+      }
+      if (pattern[pos] === '-' && pattern[pos + 1] && pattern[pos + 1] !== ']') {
+        pos++ // skip -
+        let end: string | null
+        if (pattern[pos] === '\\') {
+          end = readEscaped()
+          if (end === null) { chars.push(c, '-'); continue }
+        } else {
+          end = pattern[pos]
+          pos++
+        }
+        ranges.push([c, end])
+      } else {
+        chars.push(c)
       }
     }
     pos++ // skip ]
     return (ch: string) => {
-      if (negative) {
-        return !chars.includes(ch) && !ranges.some(([s, e]) => ch >= s && ch <= e)
-      }
-      return chars.includes(ch) || ranges.some(([s, e]) => ch >= s && ch <= e)
+      const hit = chars.includes(ch) || ranges.some(([s, e]) => ch >= s && ch <= e) || predicates.some(p => p(ch))
+      return negative ? !hit : hit
     }
+  }
+
+  // 解析一个原子（分组/字符类/转义/点/锚点/普通字符），返回 [入口状态, 出口状态]
+  function parseAtomSegment(): [number, number] {
+    let segStart: number, segEnd: number
+    const ch = pattern[pos]
+    if (ch === '(') {
+      pos++
+      let capturing = true
+      let groupName: string | null = null
+      if (pattern[pos] === '?') {
+        const next = pattern[pos + 1]
+        if (next === ':') {
+          pos += 2
+          capturing = false
+        } else if (next === '<' && pattern[pos + 2] !== '=' && pattern[pos + 2] !== '!') {
+          // 命名分组 (?<name>...)
+          pos += 2
+          const nameStart = pos
+          while (pos < pattern.length && pattern[pos] !== '>') pos++
+          groupName = pattern.substring(nameStart, pos) || null
+          if (pos < pattern.length) pos++ // skip >
+        } else {
+          // (?= (?! (?<= (?<! 等断言暂不支持，按非捕获组解析
+          pos++
+          capturing = false
+        }
+      }
+      if (capturing) {
+        groupCount++
+        const gIdx = groupCount
+        groupNames[gIdx] = groupName
+        const gStart = newState()
+        const gEnd = newState()
+        states[gStart].groupMarker = { index: gIdx, type: 'open' }
+        states[gEnd].groupMarker = { index: gIdx, type: 'close' }
+        const [s, e] = parseOr()
+        addEpsilon(gStart, s)
+        addEpsilon(e, gEnd)
+        segStart = gStart
+        segEnd = gEnd
+      } else {
+        const [s, e] = parseOr()
+        segStart = s
+        segEnd = e
+      }
+      if (pattern[pos] === ')') pos++
+    } else if (ch === '[') {
+      pos++
+      segStart = newState()
+      segEnd = newState()
+      const matcher = parseCharClass()
+      addTransition(segStart, '__class_' + segStart, segEnd)
+      states[segStart].classMatcher = matcher
+    } else if (ch === '.') {
+      segStart = newState()
+      segEnd = newState()
+      addTransition(segStart, '__dot', segEnd)
+      pos++
+    } else if (ch === '\\') {
+      pos++
+      const escaped = pattern[pos]
+      segStart = newState()
+      segEnd = newState()
+      if (escaped === 'd') addTransition(segStart, '__digit', segEnd)
+      else if (escaped === 'w') addTransition(segStart, '__word', segEnd)
+      else if (escaped === 's') addTransition(segStart, '__space', segEnd)
+      else addTransition(segStart, escaped, segEnd)
+      pos++
+    } else if (ch === '^' || ch === '$') {
+      segStart = newState()
+      segEnd = segStart
+      pos++
+    } else {
+      segStart = newState()
+      segEnd = newState()
+      addTransition(segStart, ch, segEnd)
+      pos++
+    }
+    return [segStart, segEnd]
+  }
+
+  // 解析 {n} {n,} {n,m}；语法无效时按旧逻辑跳过并返回 null
+  function parseRepetitionSpec(): { min: number; max: number | null } | null {
+    let p = pos + 1
+    let minStr = ''
+    while (p < pattern.length && /\d/.test(pattern[p])) { minStr += pattern[p]; p++ }
+    if (minStr === '') { skipBraces(); return null }
+    let max: number | null
+    if (pattern[p] === ',') {
+      p++
+      let maxStr = ''
+      while (p < pattern.length && /\d/.test(pattern[p])) { maxStr += pattern[p]; p++ }
+      max = maxStr === '' ? null : parseInt(maxStr, 10)
+    } else {
+      max = parseInt(minStr, 10)
+    }
+    if (pattern[p] !== '}') { skipBraces(); return null }
+    pos = p + 1
+    const min = parseInt(minStr, 10)
+    if (max !== null && max < min) return null
+    if (min > MAX_REPEAT || (max !== null && max > MAX_REPEAT)) {
+      throw new Error(`重复次数过大，最多支持 {${MAX_REPEAT}}`)
+    }
+    return { min, max }
+  }
+
+  function skipBraces() {
+    while (pos < pattern.length && pattern[pos] !== '}') pos++
+    if (pos < pattern.length) pos++
   }
 
   function parseConcat(): [number, number] {
     let start = newState()
     let end = start
     while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
-      let segStart: number, segEnd: number
-      const ch = pattern[pos]
-      if (ch === '(') {
-        pos++
-        groupCount++
-        if (pattern[pos] === '?') {
-          pos++
-          if (pattern[pos] === ':') { pos++; }
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        } else {
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        }
-        pos++ // skip )
-      } else if (ch === '[') {
-        pos++
-        segStart = newState()
-        segEnd = newState()
-        const matcher = parseCharClass()
-        addTransition(segStart, '__class_' + segStart, segEnd)
-        ;(states[segEnd] as any)._matcher = matcher
-      } else if (ch === '.') {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, '__dot', segEnd)
-        pos++
-      } else if (ch === '\\') {
-        pos++
-        const escaped = pattern[pos]
-        segStart = newState()
-        segEnd = newState()
-        if (escaped === 'd') addTransition(segStart, '__digit', segEnd)
-        else if (escaped === 'w') addTransition(segStart, '__word', segEnd)
-        else if (escaped === 's') addTransition(segStart, '__space', segEnd)
-        else addTransition(segStart, escaped, segEnd)
-        pos++
-      } else if (ch === '^' || ch === '$') {
-        segStart = newState()
-        segEnd = segStart
-        pos++
-      } else {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, ch, segEnd)
-        pos++
-      }
+      const atomStart = pos
+      const groupCountBeforeAtom = groupCount
+      let [segStart, segEnd] = parseAtomSegment()
 
       // Handle quantifiers
       while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
         const q = pattern[pos]
         if (q === '{') {
-          while (pos < pattern.length && pattern[pos] !== '}') pos++
-          pos++
-        } else {
-          pos++
+          const rep = parseRepetitionSpec()
+          if (rep) {
+            const afterQuant = pos
+            // 重新解析原子源码生成一个副本；分组编号复用，保证捕获语义为“最后一次迭代生效”
+            const reparseAtom = (): [number, number] => {
+              groupCount = groupCountBeforeAtom
+              pos = atomStart
+              return parseAtomSegment()
+            }
+            if (rep.min === 0 && rep.max === null) {
+              // {0,} 等价于 *
+              const qStart = newState()
+              const qEnd = newState()
+              addEpsilon(qStart, segStart)
+              addEpsilon(qStart, qEnd)
+              addEpsilon(segEnd, segStart)
+              addEpsilon(segEnd, qEnd)
+              segStart = qStart
+              segEnd = qEnd
+            } else {
+              if (rep.min === 0) {
+                // 第一份本身可选
+                const qStart = newState()
+                const qEnd = newState()
+                addEpsilon(qStart, segStart)
+                addEpsilon(qStart, qEnd)
+                addEpsilon(segEnd, qEnd)
+                segStart = qStart
+                segEnd = qEnd
+              } else {
+                // 必需的其余副本
+                for (let k = 2; k <= rep.min; k++) {
+                  const [s, e] = reparseAtom()
+                  addEpsilon(segEnd, s)
+                  segEnd = e
+                }
+              }
+              if (rep.max === null) {
+                // {n,}：追加一个星号副本
+                const [s, e] = reparseAtom()
+                const qStart = newState()
+                const qEnd = newState()
+                addEpsilon(segEnd, qStart)
+                addEpsilon(qStart, s)
+                addEpsilon(qStart, qEnd)
+                addEpsilon(e, s)
+                addEpsilon(e, qEnd)
+                segEnd = qEnd
+              } else {
+                // 可选副本 (min+1..max)，min 为 0 时从第 2 份开始
+                const from = rep.min === 0 ? 2 : rep.min + 1
+                for (let k = from; k <= rep.max; k++) {
+                  const [s, e] = reparseAtom()
+                  const qStart = newState()
+                  const qEnd = newState()
+                  addEpsilon(segEnd, qStart)
+                  addEpsilon(qStart, s)
+                  addEpsilon(qStart, qEnd)
+                  addEpsilon(e, qEnd)
+                  segEnd = qEnd
+                }
+              }
+            }
+            pos = afterQuant
+            if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
+            continue
+          }
+          continue // 无效 {..} 语法：忽略，保持旧行为
         }
+        pos++
         const qStart = newState()
         const qEnd = newState()
         addEpsilon(qStart, segStart)
-        if (q === '*') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
-        else if (q === '+') { addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
+        if (q === '*') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, segStart); addEpsilon(segEnd, qEnd) }
+        else if (q === '+') { addEpsilon(segEnd, segStart); addEpsilon(segEnd, qEnd) }
         else if (q === '?') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd) }
         segStart = qStart; segEnd = qEnd
         if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
@@ -174,22 +351,35 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
 
   const [startState, acceptState] = parseOr()
   states[acceptState].isAccept = true
-  return { states, startState, acceptStates: [acceptState] }
+  return { states, startState, acceptStates: [acceptState], groupCount, groupNames }
 }
 
-function epsilonClosure(states: StateNode[], stateId: number): Set<number> {
-  const closure = new Set<number>([stateId])
-  const stack = [stateId]
+// 捕获感知的 ε 闭包：经过分组标记状态时记录该分组在当前位置的边界
+function closureThreads(states: StateNode[], stateId: number, caps: Map<number, CaptureSpan>, pos: number): Thread[] {
+  const result: Thread[] = []
+  const visited = new Set<number>()
+  const stack: Thread[] = [{ state: stateId, caps }]
   while (stack.length) {
-    const s = stack.pop()!
-    for (const next of states[s].epsilonTransitions) {
-      if (!closure.has(next)) {
-        closure.add(next)
-        stack.push(next)
-      }
+    const t = stack.pop()!
+    if (visited.has(t.state)) continue
+    visited.add(t.state)
+    let c = t.caps
+    const marker = states[t.state].groupMarker
+    if (marker) {
+      c = new Map(t.caps)
+      const entry: CaptureSpan = { ...c.get(marker.index) }
+      if (marker.type === 'open') entry.start = pos
+      else entry.end = pos
+      c.set(marker.index, entry)
+    }
+    result.push({ state: t.state, caps: c })
+    // 逆序入栈，保证先添加的 ε 边先被探索（贪婪优先级：进入/循环 优于 跳过/退出）
+    const eps = states[t.state].epsilonTransitions
+    for (let k = eps.length - 1; k >= 0; k--) {
+      if (!visited.has(eps[k])) stack.push({ state: eps[k], caps: c })
     }
   }
-  return closure
+  return result
 }
 
 function matchTransition(state: StateNode, symbol: string): number[] {
@@ -201,44 +391,48 @@ function matchTransition(state: StateNode, symbol: string): number[] {
     if (sym === '__word' && /\w/.test(symbol)) { results.push(...targets); continue }
     if (sym === '__space' && /\s/.test(symbol)) { results.push(...targets); continue }
     if (sym.startsWith('__class_')) {
-      const matcher = (state as any)._matcher
-      if (matcher && matcher(symbol)) results.push(...targets)
+      if (state.classMatcher && state.classMatcher(symbol)) results.push(...targets)
     }
   }
   return results
 }
 
-function runMatch(states: StateNode[], startState: number, input: string): MatchResult {
+function runMatch(states: StateNode[], startState: number, input: string, groupCount: number, groupNames: (string | null)[]): MatchResult {
   const steps: MatchStep[] = []
   let backtracks = 0
   let stepIndex = 0
   const startTime = performance.now()
 
+  const findAccept = (threads: Thread[]): Thread | undefined => threads.find(t => states[t.state].isAccept)
+
   // Try to match from each position
   for (let startPos = 0; startPos <= input.length; startPos++) {
-    let currentStates = Array.from(epsilonClosure(states, startState))
+    let threads = closureThreads(states, startState, new Map(), startPos)
     let matched = false
     let matchEnd = startPos
+    let matchedCaps: Map<number, CaptureSpan> | null = null
+
+    const initialAccept = findAccept(threads)
+    if (initialAccept) { matched = true; matchEnd = startPos; matchedCaps = initialAccept.caps }
 
     for (let i = startPos; i < input.length; i++) {
       const char = input[i]
-      const nextStates: number[] = []
+      const nextThreads: Thread[] = []
       const seen = new Set<number>()
 
-      for (const s of currentStates) {
-        const targets = matchTransition(states[s], char)
-        for (const t of targets) {
-          const closure = epsilonClosure(states, t)
-          for (const c of closure) {
-            if (!seen.has(c)) {
-              seen.add(c)
-              nextStates.push(c)
+      for (const t of threads) {
+        const targets = matchTransition(states[t.state], char)
+        for (const target of targets) {
+          for (const ct of closureThreads(states, target, t.caps, i + 1)) {
+            if (!seen.has(ct.state)) {
+              seen.add(ct.state)
+              nextThreads.push(ct)
               steps.push({
                 stepIndex: stepIndex++,
                 charIndex: i,
                 char,
-                currentState: s,
-                nextState: c,
+                currentState: t.state,
+                nextState: ct.state,
                 transition: char,
                 isBacktrack: false,
                 isMatch: true
@@ -248,14 +442,14 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
         }
       }
 
-      if (nextStates.length === 0) {
-        if (currentStates.some(s => states[s].isAccept)) { matched = true; matchEnd = i; break }
+      if (nextThreads.length === 0) {
+        if (matched) break
         backtracks++
         steps.push({
           stepIndex: stepIndex++,
           charIndex: i,
           char,
-          currentState: currentStates[0] || -1,
+          currentState: threads.length ? threads[0].state : -1,
           nextState: -1,
           transition: 'FAIL',
           isBacktrack: true,
@@ -263,17 +457,33 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
         })
         break
       }
-      currentStates = nextStates
-      if (currentStates.some(s => states[s].isAccept)) { matched = true; matchEnd = i + 1 }
+
+      threads = nextThreads
+      const accept = findAccept(threads)
+      if (accept) { matched = true; matchEnd = i + 1; matchedCaps = accept.caps }
     }
 
-    if (matched || (startPos === input.length && currentStates.some(s => states[s].isAccept))) {
+    if (matched && matchedCaps !== null) {
       const matchText = input.substring(startPos, matchEnd)
+      const groups: GroupCapture[] = [{ index: 0, name: null, text: matchText, start: startPos, end: matchEnd }]
+      for (let g = 1; g <= groupCount; g++) {
+        const span = matchedCaps.get(g)
+        const participated = !!span && span.start !== undefined && span.end !== undefined && span.end >= span.start
+        groups.push({
+          index: g,
+          name: groupNames[g] ?? null,
+          text: participated ? input.substring(span!.start!, span!.end!) : null,
+          start: participated ? span!.start! : -1,
+          end: participated ? span!.end! : -1
+        })
+      }
       const duration = performance.now() - startTime
       return {
         matched: true,
         matchText,
-        groups: [matchText],
+        matchStart: startPos,
+        matchEnd,
+        groups,
         steps,
         backtracks,
         totalSteps: stepIndex,
@@ -283,7 +493,7 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
   }
 
   const duration = performance.now() - startTime
-  return { matched: false, matchText: '', groups: [], steps, backtracks, totalSteps: stepIndex, duration: Math.round(duration * 100) / 100 }
+  return { matched: false, matchText: '', matchStart: -1, matchEnd: -1, groups: [], steps, backtracks, totalSteps: stepIndex, duration: Math.round(duration * 100) / 100 }
 }
 
 export function computeNFA(nfaResult: ReturnType<typeof buildNFA>): NFA {
@@ -325,11 +535,25 @@ export function parseAST(pattern: string): ASTNode {
     const ch = pattern[pos]
     if (ch === '(') {
       pos++
-      if (pattern[pos] === '?') { pos++; if (pattern[pos] === ':') pos++ }
-      else groupIdx++
+      let capturing = true
+      let name: string | undefined
+      if (pattern[pos] === '?') {
+        pos++
+        if (pattern[pos] === ':') { pos++; capturing = false }
+        else if (pattern[pos] === '<' && pattern[pos + 1] !== '=' && pattern[pos + 1] !== '!') {
+          pos++
+          const nameStart = pos
+          while (pos < pattern.length && pattern[pos] !== '>') pos++
+          name = pattern.substring(nameStart, pos) || undefined
+          if (pos < pattern.length) pos++
+        } else {
+          capturing = false
+        }
+      }
+      if (capturing) groupIdx++
       const node = parseOr()
       if (pattern[pos] === ')') pos++
-      return { type: 'group', children: [node], groupIndex: groupIdx }
+      return { type: 'group', children: [node], groupIndex: capturing ? groupIdx : undefined, name }
     }
     if (ch === '[') {
       pos++
@@ -404,26 +628,51 @@ export const useRegexStore = defineStore('regex', () => {
 
   const groupColors = GROUP_COLORS
 
+  // 分组颜色：整体匹配固定绿色，分组 i 固定取色板第 i 色，保证任何情况下颜色稳定对应
+  function groupColor(index: number): string {
+    if (index <= 0) return WHOLE_MATCH_COLOR
+    return GROUP_COLORS[(index - 1) % GROUP_COLORS.length]
+  }
+
   const matchHighlight = computed(() => {
-    if (!matchResult.value || !matchResult.value.matched) return null
-    const matchText = matchResult.value.matchText
-    const idx = testString.value.indexOf(matchText)
-    if (idx === -1) return null
-    return {
-      before: testString.value.substring(0, idx),
-      match: matchText,
-      after: testString.value.substring(idx + matchText.length)
+    const r = matchResult.value
+    if (!r || !r.matched || r.matchStart < 0) return null
+    const s = testString.value
+    const start = Math.max(0, Math.min(r.matchStart, s.length))
+    const end = Math.max(start, Math.min(r.matchEnd, s.length))
+    // 按偏移量切分匹配区，每个字符归属最内层分组，保证步骤切换/播放时标注不错位
+    const runs: HighlightRun[] = []
+    for (let p = start; p < end; p++) {
+      let best: number | null = null
+      let bestLen = Infinity
+      for (const g of r.groups) {
+        if (g.index === 0 || g.text === null || g.start < 0) continue
+        if (g.start <= p && p < g.end) {
+          const len = g.end - g.start
+          if (len < bestLen || (len === bestLen && best !== null && g.index > best)) {
+            best = g.index
+            bestLen = len
+          }
+        }
+      }
+      const last = runs[runs.length - 1]
+      if (last && last.groupIndex === best) last.text += s[p]
+      else runs.push({ text: s[p], groupIndex: best })
     }
+    return { before: s.slice(0, start), after: s.slice(end), runs }
   })
 
+  let playTimer: ReturnType<typeof setInterval> | null = null
+
   function execute() {
+    stop()
+    currentStep.value = 0
     error.value = ''
     try {
       const built = buildNFA(pattern.value)
       nfa.value = computeNFA(built)
-      matchResult.value = runMatch(built.states, built.startState, testString.value)
+      matchResult.value = runMatch(built.states, built.startState, testString.value, built.groupCount, built.groupNames)
       ast.value = parseAST(pattern.value)
-      currentStep.value = 0
     } catch (e: any) {
       error.value = e.message || '正则表达式解析错误'
       nfa.value = null
@@ -464,24 +713,28 @@ export const useRegexStore = defineStore('regex', () => {
   }
 
   function play() {
+    if (playTimer !== null || !matchResult.value || matchResult.value.steps.length === 0) return
     isPlaying.value = true
-    const interval = setInterval(() => {
+    playTimer = setInterval(() => {
       if (matchResult.value && currentStep.value < matchResult.value.steps.length - 1) {
         currentStep.value++
       } else {
-        isPlaying.value = false
-        clearInterval(interval)
+        stop()
       }
     }, 200)
   }
 
   function stop() {
     isPlaying.value = false
+    if (playTimer !== null) {
+      clearInterval(playTimer)
+      playTimer = null
+    }
   }
 
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
-    selectedTemplate, groupColors, matchHighlight,
+    selectedTemplate, groupColors, groupColor, matchHighlight,
     execute, setPattern, setTestString, applyTemplate,
     stepForward, stepBackward, resetStep, play, stop
   }

@@ -26,7 +26,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useRegexStore } from '../store/regex'
 
 const store = useRegexStore()
@@ -47,4 +47,18 @@ function execute() {
   store.setTestString(localTestString.value)
   store.execute()
 }
+
+// 应用模板等外部修改后同步输入框，并取消未执行的防抖，避免旧输入覆盖新模板
+watch(() => store.pattern, (v) => {
+  if (v !== localPattern.value) {
+    clearTimeout(debounceTimer)
+    localPattern.value = v
+  }
+})
+watch(() => store.testString, (v) => {
+  if (v !== localTestString.value) {
+    clearTimeout(debounceTimer)
+    localTestString.value = v
+  }
+})
 </script>
