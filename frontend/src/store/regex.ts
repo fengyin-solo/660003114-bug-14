@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import type { NFA, MatchGroup, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
 
-const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
+const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6', '#06b6d4']
+const FULL_MATCH_COLOR = '#22c55e'
 
 export const TEMPLATES: RegexTemplate[] = [
   { name: '邮箱地址', pattern: '^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$', description: '匹配标准邮箱格式：用户名@域名.顶级域', testString: 'user@example.com admin@mail.org test.user+tag@sub.domain.co.uk', category: '常用' },
@@ -28,164 +29,496 @@ export const TEMPLATES: RegexTemplate[] = [
   { name: '时间格式', pattern: '^([01]?\\d|2[0-3]):([0-5]\\d)(?::([0-5]\\d))?$', description: 'HH:MM或HH:MM:SS', testString: '14:30 23:59:59 00:00', category: '常用' }
 ]
 
+interface Fragment {
+  start: number
+  end: number
+}
+
+interface MatcherInfo {
+  label: string
+  test: (ch: string) => boolean
+}
+
+interface AssertionInfo {
+  to: number
+  test: (input: string, index: number) => boolean
+}
+
 interface StateNode {
   id: number
   isAccept: boolean
   transitions: Map<string, number[]>
   epsilonTransitions: number[]
+  matchers: Map<string, MatcherInfo>
+  assertions: AssertionInfo[]
+}
+
+interface CapturingGroupMeta {
+  index: number
+  name?: string
 }
 
 function buildNFA(pattern: string): { states: StateNode[]; startState: number; acceptStates: number[] } {
   const states: StateNode[] = []
   let stateCounter = 0
+  let matcherCounter = 0
   let pos = 0
-  let groupCount = 0
 
   function newState(): number {
     const id = stateCounter++
-    states.push({ id, isAccept: false, transitions: new Map(), epsilonTransitions: [] })
+    states.push({
+      id,
+      isAccept: false,
+      transitions: new Map(),
+      epsilonTransitions: [],
+      matchers: new Map(),
+      assertions: []
+    })
     return id
   }
 
   function addTransition(from: number, symbol: string, to: number) {
-    if (!states[from].transitions.has(symbol)) {
-      states[from].transitions.set(symbol, [])
-    }
-    states[from].transitions.get(symbol)!.push(to)
+    const targets = states[from].transitions.get(symbol)
+    if (targets) targets.push(to)
+    else states[from].transitions.set(symbol, [to])
   }
 
   function addEpsilon(from: number, to: number) {
     states[from].epsilonTransitions.push(to)
   }
 
-  function parseCharClass(): (ch: string) => boolean {
+  function addMatcher(from: number, to: number, label: string, test: MatcherInfo['test']) {
+    const symbol = `__matcher_${matcherCounter++}`
+    addTransition(from, symbol, to)
+    states[from].matchers.set(symbol, { label, test })
+  }
+
+  function addAssertion(from: number, to: number, test: AssertionInfo['test']) {
+    states[from].assertions.push({ to, test })
+  }
+
+  function epsilonFragment(): Fragment {
+    const start = newState()
+    const end = newState()
+    addEpsilon(start, end)
+    return { start, end }
+  }
+
+  function literalFragment(ch: string): Fragment {
+    const start = newState()
+    const end = newState()
+    addTransition(start, ch, end)
+    return { start, end }
+  }
+
+  function isWordChar(ch: string | undefined): boolean {
+    return !!ch && /\w/.test(ch)
+  }
+
+  function anchorFragment(anchor: '^' | '$' | 'b' | 'B'): Fragment {
+    const start = newState()
+    const end = newState()
+    addAssertion(start, end, (input, index) => {
+      if (anchor === '^') return index === 0
+      if (anchor === '$') return index === input.length
+      const before = isWordChar(input[index - 1])
+      const after = isWordChar(input[index])
+      return anchor === 'b' ? before !== after : before === after
+    })
+    return { start, end }
+  }
+
+  function classTokenMatches(token: { code?: string; value?: string }, ch: string): boolean {
+    if (token.code === 'd') return /\d/.test(ch)
+    if (token.code === 'D') return !/\d/.test(ch)
+    if (token.code === 'w') return /\w/.test(ch)
+    if (token.code === 'W') return !/\w/.test(ch)
+    if (token.code === 's') return /\s/.test(ch)
+    if (token.code === 'S') return !/\s/.test(ch)
+    return token.value === ch
+  }
+
+  function readClassToken(): { code?: string; value?: string } {
+    if (pattern[pos] !== '\\') {
+      const value = pattern[pos]
+      pos++
+      return { value }
+    }
+
+    pos++
+    const escaped = pattern[pos]
+    pos++
+    if ('dDwWsS'.includes(escaped)) return { code: escaped }
+    if (escaped === 'b') return { value: '\b' }
+    if (escaped === 'n') return { value: '\n' }
+    if (escaped === 'r') return { value: '\r' }
+    if (escaped === 't') return { value: '\t' }
+    if (escaped === 'f') return { value: '\f' }
+    if (escaped === 'v') return { value: '\v' }
+    if (escaped === '0') return { value: '\0' }
+    return { value: escaped || '' }
+  }
+
+  function parseCharClass(): Fragment {
+    const classStart = pos - 1
     const negative = pattern[pos] === '^'
     if (negative) pos++
-    const ranges: [string, string][] = []
-    const chars: string[] = []
-    while (pos < pattern.length && pattern[pos] !== ']') {
-      if (pattern[pos + 1] === '-' && pattern[pos + 2] && pattern[pos + 2] !== ']') {
-        ranges.push([pattern[pos], pattern[pos + 2]])
-        pos += 3
-      } else {
-        chars.push(pattern[pos])
+
+    const tests: Array<(ch: string) => boolean> = []
+    let hasToken = false
+
+    while (pos < pattern.length) {
+      if (pattern[pos] === ']' && hasToken) break
+      const first = readClassToken()
+      hasToken = true
+
+      if (pattern[pos] === '-' && first.value !== '-' && pattern[pos + 1] && pattern[pos + 1] !== ']' && first.value !== undefined) {
         pos++
+        const second = readClassToken()
+        if (second.value === undefined) {
+          tests.push(ch => classTokenMatches(first, ch) || ch === '-')
+          tests.push(ch => classTokenMatches(second, ch))
+        } else {
+          const startCode = first.value.charCodeAt(0)
+          const endCode = second.value.charCodeAt(0)
+          if (endCode < startCode) throw new Error('字符类范围顺序错误')
+          tests.push(ch => {
+            const code = ch.charCodeAt(0)
+            return code >= startCode && code <= endCode
+          })
+        }
+      } else if (pattern[pos] === '-') {
+        tests.push(ch => ch === '-')
+        pos++
+      } else {
+        tests.push(ch => classTokenMatches(first, ch))
       }
     }
-    pos++ // skip ]
-    return (ch: string) => {
-      if (negative) {
-        return !chars.includes(ch) && !ranges.some(([s, e]) => ch >= s && ch <= e)
-      }
-      return chars.includes(ch) || ranges.some(([s, e]) => ch >= s && ch <= e)
-    }
+
+    if (pattern[pos] !== ']') throw new Error('字符类缺少结束符号 ]')
+    pos++
+    const label = pattern.slice(classStart, pos)
+    const start = newState()
+    const end = newState()
+    addMatcher(start, end, label, ch => {
+      const matched = tests.some(test => test(ch))
+      return negative ? !matched : matched
+    })
+    return { start, end }
   }
 
-  function parseConcat(): [number, number] {
-    let start = newState()
-    let end = start
-    while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
-      let segStart: number, segEnd: number
+  function skipBalancedGroup(): void {
+    let depth = 1
+    while (pos < pattern.length && depth > 0) {
       const ch = pattern[pos]
-      if (ch === '(') {
+      if (ch === '\\') pos += 2
+      else if (ch === '[') {
         pos++
-        groupCount++
-        if (pattern[pos] === '?') {
+        if (pattern[pos] === '^') pos++
+        if (pattern[pos] === ']') pos++
+        while (pos < pattern.length && pattern[pos] !== ']') {
+          if (pattern[pos] === '\\') pos++
           pos++
-          if (pattern[pos] === ':') { pos++; }
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        } else {
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
         }
-        pos++ // skip )
-      } else if (ch === '[') {
+        if (pattern[pos] !== ']') throw new Error('字符类缺少结束符号 ]')
         pos++
-        segStart = newState()
-        segEnd = newState()
-        const matcher = parseCharClass()
-        addTransition(segStart, '__class_' + segStart, segEnd)
-        ;(states[segEnd] as any)._matcher = matcher
-      } else if (ch === '.') {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, '__dot', segEnd)
+      } else if (ch === '(') {
+        depth++
         pos++
-      } else if (ch === '\\') {
-        pos++
-        const escaped = pattern[pos]
-        segStart = newState()
-        segEnd = newState()
-        if (escaped === 'd') addTransition(segStart, '__digit', segEnd)
-        else if (escaped === 'w') addTransition(segStart, '__word', segEnd)
-        else if (escaped === 's') addTransition(segStart, '__space', segEnd)
-        else addTransition(segStart, escaped, segEnd)
-        pos++
-      } else if (ch === '^' || ch === '$') {
-        segStart = newState()
-        segEnd = segStart
+      } else if (ch === ')') {
+        depth--
         pos++
       } else {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, ch, segEnd)
         pos++
       }
-
-      // Handle quantifiers
-      while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
-        const q = pattern[pos]
-        if (q === '{') {
-          while (pos < pattern.length && pattern[pos] !== '}') pos++
-          pos++
-        } else {
-          pos++
-        }
-        const qStart = newState()
-        const qEnd = newState()
-        addEpsilon(qStart, segStart)
-        if (q === '*') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
-        else if (q === '+') { addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
-        else if (q === '?') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd) }
-        segStart = qStart; segEnd = qEnd
-        if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
-      }
-
-      if (end !== segStart) addEpsilon(end, segStart)
-      end = segEnd
     }
-    return [start, end]
+    if (depth !== 0) throw new Error('分组缺少结束符号 )')
   }
 
-  function parseOr(): [number, number] {
-    const [s1, e1] = parseConcat()
-    let start = s1, end = e1
+  function readHex(count: number): string {
+    const hex = pattern.slice(pos, pos + count)
+    if (!new RegExp(`^[0-9a-fA-F]{${count}}$`).test(hex)) throw new Error('无效的 Unicode 转义')
+    pos += count
+    return String.fromCodePoint(parseInt(hex, 16))
+  }
+
+  function parseAtom(): Fragment {
+    const ch = pattern[pos]
+
+    if (ch === '(') {
+      pos++
+      if (pattern[pos] === '?') {
+        pos++
+        const kind = pattern[pos]
+
+        if (kind === '=' || kind === '!') {
+          pos++
+          skipBalancedGroup()
+          return epsilonFragment()
+        }
+
+        if (kind === '<') {
+          pos++
+          if (pattern[pos] === '=' || pattern[pos] === '!') {
+            pos++
+            skipBalancedGroup()
+            return epsilonFragment()
+          }
+
+          const nameStart = pos
+          while (pos < pattern.length && pattern[pos] !== '>') pos++
+          if (pattern[pos] !== '>') throw new Error('命名分组缺少 >')
+          const name = pattern.slice(nameStart, pos)
+          if (!/^[A-Za-z_$][\w$]*$/.test(name)) throw new Error('无效的分组名称')
+          pos++
+          const fragment = parseOr()
+          if (pattern[pos] !== ')') throw new Error('分组缺少结束符号 )')
+          pos++
+          return fragment
+        }
+
+        if (kind === ':' || kind === '>') {
+          pos++
+          const fragment = parseOr()
+          if (pattern[pos] !== ')') throw new Error('分组缺少结束符号 )')
+          pos++
+          return fragment
+        }
+
+        while (pos < pattern.length && pattern[pos] !== ':' && pattern[pos] !== ')') pos++
+        if (pattern[pos] === ':') pos++
+        else if (pattern[pos] === ')') {
+          pos++
+          return epsilonFragment()
+        } else {
+          throw new Error('无效的分组语法')
+        }
+      }
+
+      const fragment = parseOr()
+      if (pattern[pos] !== ')') throw new Error('分组缺少结束符号 )')
+      pos++
+      return fragment
+    }
+
+    if (ch === '[') {
+      pos++
+      return parseCharClass()
+    }
+
+    if (ch === '.') {
+      pos++
+      const start = newState()
+      const end = newState()
+      addMatcher(start, end, '.', character => character !== '\n')
+      return { start, end }
+    }
+
+    if (ch === '^' || ch === '$') {
+      pos++
+      return anchorFragment(ch)
+    }
+
+    if (ch === '\\') {
+      pos++
+      const escaped = pattern[pos]
+      if (escaped === undefined) throw new Error('无效的转义字符')
+      pos++
+
+      if (escaped === 'd' || escaped === 'D' || escaped === 'w' || escaped === 'W' || escaped === 's' || escaped === 'S') {
+        const start = newState()
+        const end = newState()
+        const label = `\\${escaped}`
+        addMatcher(start, end, label, character => {
+          if (escaped === 'd') return /\d/.test(character)
+          if (escaped === 'D') return !/\d/.test(character)
+          if (escaped === 'w') return /\w/.test(character)
+          if (escaped === 'W') return !/\w/.test(character)
+          if (escaped === 's') return /\s/.test(character)
+          return !/\s/.test(character)
+        })
+        return { start, end }
+      }
+
+      if (escaped === 'b' || escaped === 'B') return anchorFragment(escaped)
+      if (escaped === 'k' && pattern[pos] === '<') {
+        const nameEnd = pattern.indexOf('>', pos + 1)
+        if (nameEnd === -1) throw new Error('命名反向引用缺少 >')
+        pos = nameEnd + 1
+        return epsilonFragment()
+      }
+      if (escaped >= '1' && escaped <= '9') return epsilonFragment()
+
+      let value = escaped
+      if (escaped === 'n') value = '\n'
+      else if (escaped === 'r') value = '\r'
+      else if (escaped === 't') value = '\t'
+      else if (escaped === 'f') value = '\f'
+      else if (escaped === 'v') value = '\v'
+      else if (escaped === '0') value = '\0'
+      else if (escaped === 'x') value = readHex(2)
+      else if (escaped === 'u') {
+        if (pattern[pos] === '{') {
+          pos++
+          const end = pattern.indexOf('}', pos)
+          if (end === -1) throw new Error('无效的 Unicode 转义')
+          const hex = pattern.slice(pos, end)
+          if (!/^[0-9a-fA-F]+$/.test(hex)) throw new Error('无效的 Unicode 转义')
+          value = String.fromCodePoint(parseInt(hex, 16))
+          pos = end + 1
+        } else {
+          value = readHex(4)
+        }
+      }
+
+      return literalFragment(value)
+    }
+
+    if (ch === undefined) throw new Error('意外的正则结尾')
+    pos++
+    return literalFragment(ch)
+  }
+
+  function cloneFragment(fragment: Fragment): Fragment {
+    const mapping = new Map<number, number>()
+    for (let oldId = fragment.start; oldId <= fragment.end; oldId++) {
+      const oldState = states[oldId]
+      const newId = newState()
+      mapping.set(oldId, newId)
+      states[newId].isAccept = oldState.isAccept
+      oldState.matchers.forEach((matcher, symbol) => states[newId].matchers.set(symbol, matcher))
+    }
+
+    // Remap targets after every state in the fragment has been cloned.
+    for (let oldId = fragment.start; oldId <= fragment.end; oldId++) {
+      const oldState = states[oldId]
+      const newId = mapping.get(oldId)!
+      const newState = states[newId]
+      newState.transitions.clear()
+      oldState.transitions.forEach((targets, symbol) => {
+        newState.transitions.set(symbol, targets.map(target => mapping.get(target) ?? target))
+      })
+      newState.epsilonTransitions = oldState.epsilonTransitions.map(target => mapping.get(target) ?? target)
+      newState.assertions = oldState.assertions.map(assertion => ({
+        to: mapping.get(assertion.to) ?? assertion.to,
+        test: assertion.test
+      }))
+    }
+
+    return { start: mapping.get(fragment.start)!, end: mapping.get(fragment.end)! }
+  }
+
+  function appendFragment(target: Fragment, part: Fragment): Fragment {
+    addEpsilon(target.end, part.start)
+    return { start: target.start, end: part.end }
+  }
+
+  function applySimpleQuantifier(fragment: Fragment, quantifier: '*' | '+' | '?'): Fragment {
+    const start = newState()
+    const end = newState()
+    addEpsilon(start, fragment.start)
+    if (quantifier === '*') {
+      addEpsilon(start, end)
+      addEpsilon(fragment.end, end)
+      addEpsilon(fragment.end, fragment.start)
+    } else if (quantifier === '+') {
+      addEpsilon(fragment.end, end)
+      addEpsilon(fragment.end, fragment.start)
+    } else {
+      addEpsilon(start, end)
+      addEpsilon(fragment.end, end)
+    }
+    return { start, end }
+  }
+
+  function repeatFragment(fragment: Fragment, min: number, max: number): Fragment {
+    let result = epsilonFragment()
+    for (let i = 0; i < min; i++) {
+      result = appendFragment(result, cloneFragment(fragment))
+    }
+
+    if (!Number.isFinite(max)) {
+      result = appendFragment(result, applySimpleQuantifier(cloneFragment(fragment), '*'))
+    } else {
+      const optionalCount = max - min
+      for (let i = 0; i < optionalCount; i++) {
+        result = appendFragment(result, applySimpleQuantifier(cloneFragment(fragment), '?'))
+      }
+    }
+    return result
+  }
+
+  function applyQuantifiers(fragment: Fragment): Fragment {
+    let result = fragment
+    while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
+      if (pattern[pos] === '{') {
+        const matched = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(pos))
+        if (!matched) break
+        const min = Number(matched[1])
+        const max = matched[2] === undefined ? min : matched[2] === '' ? Number.POSITIVE_INFINITY : Number(matched[2])
+        if (Number.isFinite(max) && max < min) throw new Error('量词范围无效')
+        pos += matched[0].length
+        result = repeatFragment(result, min, max)
+      } else {
+        const quantifier = pattern[pos] as '*' | '+' | '?'
+        pos++
+        result = applySimpleQuantifier(result, quantifier)
+      }
+      if (pattern[pos] === '?') pos++
+    }
+    return result
+  }
+
+  function parseConcat(): Fragment {
+    let result: Fragment | null = null
+    while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
+      const atom = applyQuantifiers(parseAtom())
+      result = result ? appendFragment(result, atom) : atom
+    }
+    return result ?? epsilonFragment()
+  }
+
+  function parseOr(): Fragment {
+    let left = parseConcat()
     while (pos < pattern.length && pattern[pos] === '|') {
       pos++
-      const [s2, e2] = parseConcat()
-      const ns = newState(), ne = newState()
-      addEpsilon(ns, start); addEpsilon(ns, s2)
-      addEpsilon(end, ne); addEpsilon(e2, ne)
-      start = ns; end = ne
+      const right = parseConcat()
+      const start = newState()
+      const end = newState()
+      addEpsilon(start, left.start)
+      addEpsilon(start, right.start)
+      addEpsilon(left.end, end)
+      addEpsilon(right.end, end)
+      left = { start, end }
     }
-    return [start, end]
+    return left
   }
 
-  const [startState, acceptState] = parseOr()
+  const startState = newState()
+  const body = parseOr()
+  if (pos !== pattern.length) throw new Error('正则表达式解析失败')
+  addEpsilon(startState, body.start)
+  const acceptState = body.end
   states[acceptState].isAccept = true
   return { states, startState, acceptStates: [acceptState] }
 }
 
-function epsilonClosure(states: StateNode[], stateId: number): Set<number> {
+function epsilonClosure(states: StateNode[], stateId: number, input = '', index = 0): Set<number> {
   const closure = new Set<number>([stateId])
   const stack = [stateId]
   while (stack.length) {
-    const s = stack.pop()!
-    for (const next of states[s].epsilonTransitions) {
+    const stateId = stack.pop()!
+    const state = states[stateId]
+    for (const next of state.epsilonTransitions) {
       if (!closure.has(next)) {
         closure.add(next)
         stack.push(next)
+      }
+    }
+    for (const assertion of state.assertions) {
+      if (assertion.test(input, index) && !closure.has(assertion.to)) {
+        closure.add(assertion.to)
+        stack.push(assertion.to)
       }
     }
   }
@@ -194,51 +527,51 @@ function epsilonClosure(states: StateNode[], stateId: number): Set<number> {
 
 function matchTransition(state: StateNode, symbol: string): number[] {
   const results: number[] = []
-  for (const [sym, targets] of state.transitions) {
-    if (sym === symbol) { results.push(...targets); continue }
-    if (sym === '__dot' && symbol !== '\n') { results.push(...targets); continue }
-    if (sym === '__digit' && /\d/.test(symbol)) { results.push(...targets); continue }
-    if (sym === '__word' && /\w/.test(symbol)) { results.push(...targets); continue }
-    if (sym === '__space' && /\s/.test(symbol)) { results.push(...targets); continue }
-    if (sym.startsWith('__class_')) {
-      const matcher = (state as any)._matcher
-      if (matcher && matcher(symbol)) results.push(...targets)
+  for (const [transitionSymbol, targets] of state.transitions) {
+    if (transitionSymbol === symbol) {
+      results.push(...targets)
+      continue
+    }
+    if (transitionSymbol.startsWith('__matcher_')) {
+      const matcher = state.matchers.get(transitionSymbol)
+      if (matcher?.test(symbol)) results.push(...targets)
     }
   }
   return results
 }
 
-function runMatch(states: StateNode[], startState: number, input: string): MatchResult {
+function runMatch(states: StateNode[], startState: number, input: string) {
   const steps: MatchStep[] = []
   let backtracks = 0
   let stepIndex = 0
   const startTime = performance.now()
 
-  // Try to match from each position
   for (let startPos = 0; startPos <= input.length; startPos++) {
-    let currentStates = Array.from(epsilonClosure(states, startState))
+    let currentStates = Array.from(epsilonClosure(states, startState, input, startPos))
+    const acceptsBeforeConsuming = currentStates.some(state => states[state].isAccept)
     let matched = false
     let matchEnd = startPos
+    let consumed = false
 
     for (let i = startPos; i < input.length; i++) {
       const char = input[i]
       const nextStates: number[] = []
       const seen = new Set<number>()
 
-      for (const s of currentStates) {
-        const targets = matchTransition(states[s], char)
-        for (const t of targets) {
-          const closure = epsilonClosure(states, t)
-          for (const c of closure) {
-            if (!seen.has(c)) {
-              seen.add(c)
-              nextStates.push(c)
+      for (const stateId of currentStates) {
+        const targets = matchTransition(states[stateId], char)
+        for (const target of targets) {
+          const closure = epsilonClosure(states, target, input, i + 1)
+          for (const nextState of closure) {
+            if (!seen.has(nextState)) {
+              seen.add(nextState)
+              nextStates.push(nextState)
               steps.push({
                 stepIndex: stepIndex++,
                 charIndex: i,
                 char,
-                currentState: s,
-                nextState: c,
+                currentState: stateId,
+                nextState,
                 transition: char,
                 isBacktrack: false,
                 isMatch: true
@@ -249,13 +582,17 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
       }
 
       if (nextStates.length === 0) {
-        if (currentStates.some(s => states[s].isAccept)) { matched = true; matchEnd = i; break }
+        if (currentStates.some(state => states[state].isAccept)) {
+          matched = true
+          matchEnd = i
+          break
+        }
         backtracks++
         steps.push({
           stepIndex: stepIndex++,
           charIndex: i,
           char,
-          currentState: currentStates[0] || -1,
+          currentState: currentStates[0] ?? -1,
           nextState: -1,
           transition: 'FAIL',
           isBacktrack: true,
@@ -263,61 +600,87 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
         })
         break
       }
+
+      consumed = true
       currentStates = nextStates
-      if (currentStates.some(s => states[s].isAccept)) { matched = true; matchEnd = i + 1 }
+      if (currentStates.some(state => states[state].isAccept)) {
+        matched = true
+        matchEnd = i + 1
+      }
     }
 
-    if (matched || (startPos === input.length && currentStates.some(s => states[s].isAccept))) {
-      const matchText = input.substring(startPos, matchEnd)
-      const duration = performance.now() - startTime
+    const acceptsAtEnd = currentStates.some(state => states[state].isAccept)
+    if (acceptsAtEnd && (consumed || acceptsBeforeConsuming)) {
+      matched = true
+    }
+
+    if (matched) {
       return {
-        matched: true,
-        matchText,
-        groups: [matchText],
+        start: startPos,
+        end: matchEnd,
         steps,
         backtracks,
         totalSteps: stepIndex,
-        duration: Math.round(duration * 100) / 100
+        duration: performance.now() - startTime
       }
     }
   }
 
-  const duration = performance.now() - startTime
-  return { matched: false, matchText: '', groups: [], steps, backtracks, totalSteps: stepIndex, duration: Math.round(duration * 100) / 100 }
+  return {
+    start: -1,
+    end: -1,
+    steps,
+    backtracks,
+    totalSteps: stepIndex,
+    duration: performance.now() - startTime
+  }
 }
 
 export function computeNFA(nfaResult: ReturnType<typeof buildNFA>): NFA {
-  const nodes = nfaResult.states.map((s, i) => ({
-    id: s.id,
-    isStart: i === nfaResult.startState,
-    isAccept: nfaResult.acceptStates.includes(s.id),
-    x: 0, y: 0
+  const nodes = nfaResult.states.map((state, index) => ({
+    id: state.id,
+    isStart: index === nfaResult.startState,
+    isAccept: nfaResult.acceptStates.includes(state.id),
+    x: 0,
+    y: 0
   }))
 
-  // Layout: circular
-  const cx = 400, cy = 300, radius = 200
-  nodes.forEach((n, i) => {
-    const angle = (i / nodes.length) * Math.PI * 2
-    n.x = cx + Math.cos(angle) * radius
-    n.y = cy + Math.sin(angle) * radius
+  const cx = 400
+  const cy = 300
+  const radius = Math.max(180, nodes.length * 7)
+  nodes.forEach((node, index) => {
+    const angle = (index / nodes.length) * Math.PI * 2
+    node.x = cx + Math.cos(angle) * radius
+    node.y = cy + Math.sin(angle) * radius
   })
 
-  const transitions: any[] = []
-  nfaResult.states.forEach(s => {
-    s.transitions.forEach((targets, symbol) => {
-      targets.forEach(t => {
-        transitions.push({ from: s.id, to: t, symbol: symbol.startsWith('__') ? symbol.replace('__', '') : symbol, label: symbol.startsWith('__') ? symbol.replace('__', '') : symbol })
+  const transitions: NFA['transitions'] = []
+  const seen = new Set<string>()
+  nfaResult.states.forEach(state => {
+    state.transitions.forEach((targets, symbol) => {
+      targets.forEach(to => {
+        const matcher = state.matchers.get(symbol)
+        const label = matcher?.label ?? symbol
+        const key = `${state.id}-${to}-${label}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          transitions.push({ from: state.id, to, symbol, label })
+        }
       })
     })
-    s.epsilonTransitions.forEach(t => {
-      transitions.push({ from: s.id, to: t, symbol: null, label: 'ε' })
+    state.epsilonTransitions.forEach(to => {
+      const key = `${state.id}-${to}-ε`
+      if (!seen.has(key)) {
+        seen.add(key)
+        transitions.push({ from: state.id, to, symbol: null, label: 'ε' })
+      }
     })
   })
 
   return { states: nodes, transitions, startState: nfaResult.startState, acceptStates: nfaResult.acceptStates }
 }
 
-export function parseAST(pattern: string): ASTNode {
+function parseAST(pattern: string): ASTNode {
   let pos = 0
   let groupIdx = 0
 
@@ -325,16 +688,46 @@ export function parseAST(pattern: string): ASTNode {
     const ch = pattern[pos]
     if (ch === '(') {
       pos++
-      if (pattern[pos] === '?') { pos++; if (pattern[pos] === ':') pos++ }
-      else groupIdx++
+      let capturing = true
+      if (pattern[pos] === '?') {
+        pos++
+        if (pattern[pos] === ':') {
+          pos++
+          capturing = false
+        } else if (pattern[pos] === '<') {
+          pos++
+          if (pattern[pos] !== '=' && pattern[pos] !== '!') {
+            while (pos < pattern.length && pattern[pos] !== '>') pos++
+            pos++
+          } else {
+            capturing = false
+          }
+        } else if (pattern[pos] === '=' || pattern[pos] === '!') {
+          capturing = false
+        } else {
+          while (pos < pattern.length && pattern[pos] !== ':' && pattern[pos] !== ')') pos++
+          if (pattern[pos] === ':') pos++
+          else capturing = false
+        }
+      }
+      if (capturing) groupIdx++
+      const currentGroup = groupIdx
       const node = parseOr()
       if (pattern[pos] === ')') pos++
-      return { type: 'group', children: [node], groupIndex: groupIdx }
+      return { type: 'group', children: [node], groupIndex: capturing ? currentGroup : undefined }
     }
     if (ch === '[') {
       pos++
       let cls = ''
-      while (pos < pattern.length && pattern[pos] !== ']') { cls += pattern[pos]; pos++ }
+      if (pattern[pos] === '^') {
+        cls += '^'
+        pos++
+      }
+      while (pos < pattern.length && pattern[pos] !== ']') {
+        cls += pattern[pos]
+        if (pattern[pos] === '\\') pos++
+        pos++
+      }
       pos++
       return { type: 'charclass', value: cls }
     }
@@ -357,14 +750,20 @@ export function parseAST(pattern: string): ASTNode {
     while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
       const q = pattern[pos]
       if (q === '{') {
-        while (pos < pattern.length && pattern[pos] !== '}') pos++
-        pos++
+        const matched = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(pos))
+        if (!matched) {
+          node = { type: 'concat', children: [node, { type: 'char', value: '{' }] }
+          pos++
+          continue
+        }
+        pos += matched[0].length
+        node = { type: matched[1] === '0' ? 'question' : 'plus', children: [node] }
       } else {
         pos++
+        const type = q === '*' ? 'star' : q === '+' ? 'plus' : 'question'
+        node = { type, children: [node] }
       }
-      const type = q === '*' ? 'star' : q === '+' ? 'plus' : 'question'
-      node = { type, children: [node] }
-      if (pos < pattern.length && pattern[pos] === '?') pos++
+      if (pattern[pos] === '?') pos++
     }
     return node
   }
@@ -391,6 +790,88 @@ export function parseAST(pattern: string): ASTNode {
   return parseOr()
 }
 
+function scanCapturingGroups(pattern: string): CapturingGroupMeta[] {
+  const groups: CapturingGroupMeta[] = []
+  let index = 0
+  let pos = 0
+
+  function skipCharClass() {
+    pos++
+    if (pattern[pos] === '^') pos++
+    if (pattern[pos] === ']') pos++
+    while (pos < pattern.length && pattern[pos] !== ']') {
+      if (pattern[pos] === '\\') pos++
+      pos++
+    }
+    if (pattern[pos] !== ']') throw new Error('字符类缺少结束符号 ]')
+    pos++
+  }
+
+  while (pos < pattern.length) {
+    const ch = pattern[pos]
+    if (ch === '\\') pos += 2
+    else if (ch === '[') skipCharClass()
+    else if (ch === '(') {
+      pos++
+      let capturing = false
+      let name: string | undefined
+
+      if (pattern[pos] === '?') {
+        pos++
+        if (pattern[pos] === ':' || pattern[pos] === '>' || pattern[pos] === '=' || pattern[pos] === '!') {
+          pos++
+        } else if (pattern[pos] === '<') {
+          pos++
+          if (pattern[pos] === '=' || pattern[pos] === '!') {
+            pos++
+          } else {
+            capturing = true
+            const nameStart = pos
+            while (pos < pattern.length && pattern[pos] !== '>') pos++
+            if (pattern[pos] !== '>') throw new Error('命名分组缺少 >')
+            name = pattern.slice(nameStart, pos)
+            pos++
+          }
+        } else {
+          while (pos < pattern.length && pattern[pos] !== ':' && pattern[pos] !== ')') pos++
+          if (pattern[pos] === ':') pos++
+          else if (pattern[pos] === ')') pos++
+        }
+      } else {
+        capturing = true
+      }
+
+      if (capturing) groups.push({ index: ++index, name })
+    } else {
+      pos++
+    }
+  }
+
+  return groups
+}
+
+function makeGroups(metas: CapturingGroupMeta[], match: RegExpExecArray | null): MatchGroup[] {
+  const groups: MatchGroup[] = [{
+    index: 0,
+    content: match?.[0] ?? '',
+    status: !match ? 'unmatched' : match[0] === '' ? 'empty' : 'matched'
+  }]
+
+  metas.forEach(meta => {
+    if (!match) {
+      groups.push({ ...meta, content: '', status: 'unmatched' })
+      return
+    }
+    const value = match[meta.index]
+    groups.push({
+      ...meta,
+      content: value ?? '',
+      status: value === undefined ? 'unmatched' : value === '' ? 'empty' : 'matched'
+    })
+  })
+  return groups
+}
+
 export const useRegexStore = defineStore('regex', () => {
   const pattern = ref('^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$')
   const testString = ref('user@example.com admin@mail.org invalid-email')
@@ -401,39 +882,110 @@ export const useRegexStore = defineStore('regex', () => {
   const ast = ref<ASTNode | null>(null)
   const error = ref('')
   const selectedTemplate = ref<string>('')
+  let playTimer: ReturnType<typeof setInterval> | null = null
+  let inputTimer: ReturnType<typeof setTimeout> | null = null
 
   const groupColors = GROUP_COLORS
 
+  function getGroupColor(index: number): string {
+    return index === 0 ? FULL_MATCH_COLOR : GROUP_COLORS[(index - 1) % GROUP_COLORS.length]
+  }
+
   const matchHighlight = computed(() => {
-    if (!matchResult.value || !matchResult.value.matched) return null
-    const matchText = matchResult.value.matchText
-    const idx = testString.value.indexOf(matchText)
-    if (idx === -1) return null
+    const result = matchResult.value
+    if (!result?.matched || result.matchIndex < 0) return null
     return {
-      before: testString.value.substring(0, idx),
-      match: matchText,
-      after: testString.value.substring(idx + matchText.length)
+      before: testString.value.substring(0, result.matchIndex),
+      match: result.matchText,
+      after: testString.value.substring(result.matchIndex + result.matchText.length)
     }
   })
 
+  function clearPlayTimer() {
+    if (playTimer !== null) {
+      clearInterval(playTimer)
+      playTimer = null
+    }
+    isPlaying.value = false
+  }
+
   function execute() {
+    clearPlayTimer()
+    if (inputTimer !== null) {
+      clearTimeout(inputTimer)
+      inputTimer = null
+    }
+    const startTime = performance.now()
     error.value = ''
+
+    let regex: RegExp
     try {
-      const built = buildNFA(pattern.value)
-      nfa.value = computeNFA(built)
-      matchResult.value = runMatch(built.states, built.startState, testString.value)
-      ast.value = parseAST(pattern.value)
-      currentStep.value = 0
-    } catch (e: any) {
-      error.value = e.message || '正则表达式解析错误'
+      regex = new RegExp(pattern.value)
+    } catch (e) {
       nfa.value = null
       matchResult.value = null
       ast.value = null
+      currentStep.value = 0
+      error.value = e instanceof Error ? e.message : '正则表达式语法错误'
+      return
     }
+
+    let nativeMatch: RegExpExecArray | null = null
+    try {
+      nativeMatch = regex.exec(testString.value)
+    } catch (e) {
+      nfa.value = null
+      matchResult.value = null
+      ast.value = null
+      currentStep.value = 0
+      error.value = e instanceof Error ? e.message : '正则执行失败'
+      return
+    }
+
+    const metas = scanCapturingGroups(pattern.value)
+    let simulation = { steps: [] as MatchStep[], backtracks: 0, totalSteps: 0 }
+
+    try {
+      const built = buildNFA(pattern.value)
+      nfa.value = computeNFA(built)
+      simulation = runMatch(built.states, built.startState, testString.value)
+    } catch {
+      nfa.value = null
+    }
+
+    try {
+      ast.value = parseAST(pattern.value)
+    } catch {
+      ast.value = null
+    }
+
+    const groups = makeGroups(metas, nativeMatch)
+    matchResult.value = {
+      matched: nativeMatch !== null,
+      matchText: nativeMatch?.[0] ?? '',
+      matchIndex: nativeMatch?.index ?? -1,
+      groups,
+      steps: simulation.steps,
+      backtracks: simulation.backtracks,
+      totalSteps: simulation.totalSteps,
+      duration: Math.round((performance.now() - startTime) * 100) / 100
+    }
+    currentStep.value = 0
+  }
+
+  function schedulePattern(p: string) {
+    if (inputTimer !== null) clearTimeout(inputTimer)
+    inputTimer = setTimeout(() => setPattern(p), 300)
+  }
+
+  function scheduleTestString(s: string) {
+    if (inputTimer !== null) clearTimeout(inputTimer)
+    inputTimer = setTimeout(() => setTestString(s), 300)
   }
 
   function setPattern(p: string) {
     pattern.value = p
+    selectedTemplate.value = ''
     execute()
   }
 
@@ -442,7 +994,21 @@ export const useRegexStore = defineStore('regex', () => {
     execute()
   }
 
+  function setInputs(p: string, s: string) {
+    if (inputTimer !== null) {
+      clearTimeout(inputTimer)
+      inputTimer = null
+    }
+    pattern.value = p
+    testString.value = s
+    execute()
+  }
+
   function applyTemplate(t: RegexTemplate) {
+    if (inputTimer !== null) {
+      clearTimeout(inputTimer)
+      inputTimer = null
+    }
     pattern.value = t.pattern
     testString.value = t.testString
     selectedTemplate.value = t.name
@@ -464,25 +1030,27 @@ export const useRegexStore = defineStore('regex', () => {
   }
 
   function play() {
+    if (!matchResult.value || matchResult.value.steps.length === 0) return
+    clearPlayTimer()
+    if (currentStep.value >= matchResult.value.steps.length - 1) currentStep.value = 0
     isPlaying.value = true
-    const interval = setInterval(() => {
+    playTimer = setInterval(() => {
       if (matchResult.value && currentStep.value < matchResult.value.steps.length - 1) {
         currentStep.value++
       } else {
-        isPlaying.value = false
-        clearInterval(interval)
+        clearPlayTimer()
       }
     }, 200)
   }
 
   function stop() {
-    isPlaying.value = false
+    clearPlayTimer()
   }
 
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
-    selectedTemplate, groupColors, matchHighlight,
-    execute, setPattern, setTestString, applyTemplate,
+    selectedTemplate, groupColors, matchHighlight, getGroupColor,
+    execute, setPattern, setTestString, setInputs, schedulePattern, scheduleTestString, applyTemplate,
     stepForward, stepBackward, resetStep, play, stop
   }
 })

@@ -23,11 +23,12 @@ const canvasRef = ref<HTMLCanvasElement | null>(null)
 
 function draw() {
   const canvas = canvasRef.value
-  if (!canvas || !store.nfa) return
+  if (!canvas) return
   const ctx = canvas.getContext('2d')
   if (!ctx) return
 
   ctx.clearRect(0, 0, canvas.width, canvas.height)
+  if (!store.nfa) return
 
   const activeStates = new Set<number>()
   if (store.matchResult && store.currentStep < store.matchResult.steps.length) {

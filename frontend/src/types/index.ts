@@ -20,6 +20,15 @@ export interface NFA {
   acceptStates: number[]
 }
 
+export type MatchGroupStatus = 'matched' | 'empty' | 'unmatched'
+
+export interface MatchGroup {
+  index: number
+  name?: string
+  content: string
+  status: MatchGroupStatus
+}
+
 export interface MatchStep {
   stepIndex: number
   charIndex: number
@@ -34,7 +43,8 @@ export interface MatchStep {
 export interface MatchResult {
   matched: boolean
   matchText: string
-  groups: string[]
+  matchIndex: number
+  groups: MatchGroup[]
   steps: MatchStep[]
   backtracks: number
   totalSteps: number
